@@ -1,18 +1,15 @@
 from ultralytics import YOLO
 from djitellopy import Tello
-import os
 import logging
 import cv2
 import time
 from collections import Counter
 
-# === Настройки окружения ===
-os.environ["OPENCV_FFMPEG_SKIP_FRAME_CHECK"] = "1"
-
 # Отключаем логирование Tello (опционально)
 logging.getLogger("djitellopy").setLevel(logging.WARNING)
 
-FRAME_SKIP = 1  # Обрабатывать каждый N-й кадр (ускорение)
+# Загрузка предобученной модели YOLO
+model = YOLO("best_yamki-v2.pt")
 
 # === ИНИЦИАЛИЗАЦИЯ ДРОНА ===
 fly = Tello()
@@ -20,36 +17,11 @@ fly.connect()
 
 print(f"Заряд батареи: {fly.get_battery()}%")
 
-# Уменьшить битрейт видео для стабильности при слабом Wi-Fi
-fly.set_video_bitrate(1)  # 1 Мбит/с
-print("Битрейт видео установлен на 1 Мбит/с")
+# Установка битрейта для видео
+fly.set_video_bitrate(Tello.BITRATE_AUTO)
 
-# Загрузка предобученной модели YOLO
-model = YOLO("best_yamki-v2.pt")
-
-unique_tracked_ids = set()
-
-
-def track_and_count(frame, storage):
-    results = model.track(
-        frame,
-        verbose=False,
-        persist=True,
-        imgsz=320,
-        conf=0.5,
-        tracker="custom_tracker.yaml",
-    )[0]
-
-    if results.boxes.id is not None:
-        ids = results.boxes.id.int().tolist()
-        clss = results.boxes.cls.int().tolist()
-
-        # Сохранение уникальных ID и имен классов
-        for obj_id, cls_idx in zip(ids, clss):
-            storage.add((obj_id, model.names[cls_idx]))
-
-    return results.plot()
-
+# Уменьшить частоту кадров для стабильности
+fly.set_video_fps(Tello.FPS_15)
 
 # === ВКЛЮЧЕНИЕ ВИДЕОПОТОКА ===
 fly.streamon()
@@ -76,43 +48,59 @@ time.sleep(3)
 print("Дрон взлетел. Начинаю полёт...")
 
 # Глобальные переменные
-last_annotated_frame = None
-frame_counter = 0
 start_time_total = time.time()
-flight_duration = 20  # Дрон будет лететь по кругу 40 секундq
+flight_duration = 40  # Дрон будет лететь по кругу 40 секундq
 flying_circle = True
+unique_tracked_ids = set()
+
+
+def track_and_count(frame, storage):
+    results = model.track(
+        frame,
+        verbose=False,
+        persist=True,
+        conf=0.6,
+        tracker="custom_tracker.yaml",
+    )[0]
+
+    if results.boxes.id is not None:
+        ids = results.boxes.id.int().tolist()
+        clss = results.boxes.cls.int().tolist()
+
+        # Сохранение уникальных ID и имен классов
+        for obj_id, cls_idx in zip(ids, clss):
+            storage.add((obj_id, model.names[cls_idx]))
+
+    return results.plot()
+
 
 try:
     while flying_circle:
-        loop_start = time.time()
 
         # Получение кадра
         frame = frame_read.frame
-        frame_counter += 1
 
+        # Проверка на пустой кадр
         if frame is None or frame.size == 0:
             print("Пустой кадр — пропуск...")
             cv2.waitKey(1)
             continue
 
+        # Масштабирование кадра
         my_frame = cv2.resize(frame, (640, 480))
 
-        # Обработка каждого N-го кадра
-        if frame_counter % FRAME_SKIP == 0:
-            # Модель с трекингом
-            # results = model.track(
-            #     my_frame, conf=0.3, persist=True, verbose=False, imgsz=320
-            # )
-            # Модель без трекинга
-            # results = model(my_frame, conf=0.3, verbose=False, imgsz=320)
-            annotated_frame = track_and_count(my_frame, unique_tracked_ids)
-            last_annotated_frame = annotated_frame
-        else:
-            last_annotated_frame = my_frame  # fallback
+        # Модель с трекингом
+        # results = model.track(
+        #     my_frame, conf=0.3, persist=True, verbose=False, imgsz=320
+        # )
+
+        # Обработка кадра с трекингом
+        annotated_frame = track_and_count(my_frame, unique_tracked_ids)
 
         # Отображение
-        display_frame = last_annotated_frame.copy()
-        cv2.imshow("Potholes Detection", cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+        cv2.imshow(
+            "Potholes Detection", cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        )
 
         # Управление дроном: полёт)
         fly.send_rc_control(
@@ -131,18 +119,12 @@ try:
         if cv2.waitKey(1) & 0xFF == ord("q"):
             flying_circle = False
 
-        # Контроль FPS
-        elapsed = time.time() - loop_start
-        time.sleep(max(0, 0.033 - elapsed))  # ~30 FPS
-
 except Exception as e:
     print(f"Ошибка: {e}")
 finally:
     # === ПОСАДКА И ЗАВЕРШЕНИЕ ===
     fly.send_rc_control(0, 0, 0, 0)  # Остановить движение
-    time.sleep(1)
-    # fly.land()
-    time.sleep(3)
+    # fly.land()    # Посадка
     fly.streamoff()
     cv2.destroyAllWindows()
     print(f"Итоговая статистика:")
