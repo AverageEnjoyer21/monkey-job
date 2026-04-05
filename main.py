@@ -20,40 +20,35 @@ RIGHT_HIP = 12
 
 # === ЗАГРУЗКА МОДЕЛИ YOLOv8 POSE ===
 model = YOLO("yolov8n-pose.pt")
-
-# === ИНИЦИАЛИЗАЦИЯ ДРОНА ===
 fly = Tello()
-fly.connect()
 
-# Устанавливаем частоту видеосъёмки в 15 FPS
-fly.set_video_fps(Tello.FPS_15)
 
-# Устанавливаем автоматический битрейт изображения (можно поставить от 1 до 5)
-fly.set_video_bitrate(Tello.BITRATE_AUTO)
+def drone_init(fly):
+    fly.connect()
 
-# Заряд батареи
-print(f"Заряд батареи: {fly.get_battery()}%")
+    # Устанавливаем частоту видеосъёмки в 15 FPS
+    fly.set_video_fps(Tello.FPS_15)
 
-# === ВКЛЮЧЕНИЕ ВИДЕОПОТОКА ===
-fly.streamon()
-print("Видеопоток включён. Ожидание первого кадра...")
+    # Устанавливаем автоматический битрейт изображения (можно поставить от 1 до 5)
+    fly.set_video_bitrate(Tello.BITRATE_AUTO)
 
-time.sleep(2)
+    # Заряд батареи
+    print(f"Заряд батареи: {fly.get_battery()}%")
 
-# Остановить все движения при старте
-fly.send_rc_control(0, 0, 0, 0)
+    # Остановить все движения при старте
+    fly.send_rc_control(0, 0, 0, 0)
 
-# Стабилизация после запуска потока
-time.sleep(1)
-print("Отслеживание запущено. Нажмите 'q' для выхода.")
+    # === ВКЛЮЧЕНИЕ ВИДЕОПОТОКА ===
+    fly.streamon()
+    print("Видеопоток включён. Ожидание первого кадра...")
+    time.sleep(2)
 
-# Остановить все движения при старте
-fly.send_rc_control(0, 0, 0, 0)
+    # Стабилизация после запуска потока
+    time.sleep(1)
+    print("Отслеживание запущено. Нажмите 'q' для выхода.")
 
-# Взлет
-# fly.takeoff()
-
-# === ФУНКЦИИ ОБРАБОТКИ ПОЗЫ ===
+    # Взлет
+    # fly.takeoff()
 
 
 def calculate_body_center(keypoints):
@@ -213,6 +208,7 @@ def process_frame(frame):
 
 
 def main():
+    drone_init(fly)
     frame_read = fly.get_frame_read()
     """Основной цикл приложения."""
     while True:
