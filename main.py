@@ -5,7 +5,7 @@ import cv2
 import time
 
 # Отключаем логирование Tello (опционально)
-# logging.getLogger("djitellopy").setLevel(logging.WARNING)
+logging.getLogger("djitellopy").setLevel(logging.WARNING)
 
 # === ПАРАМЕТРЫ ОТСЛЕЖИВАНИЯ ===
 DEAD_ZONE_X = 150  # Мёртвая зона по горизонтали (px)
@@ -38,18 +38,10 @@ print(f"Заряд батареи: {fly.get_battery()}%")
 fly.streamon()
 print("Видеопоток включён. Ожидание первого кадра...")
 
-# Получаем первый кадр с камеры
-frame_read = fly.get_frame_read()
+time.sleep(2)
 
-# Ждём первый валидный кадр
-while True:
-    frame = frame_read.frame
-    if frame is not None and frame.size > 0:
-        print("Первый кадр получен. Запуск основного цикла.")
-        break
-    else:
-        print("Ожидание кадра...")
-        time.sleep(0.1)
+# Остановить все движения при старте
+fly.send_rc_control(0, 0, 0, 0)
 
 # Стабилизация после запуска потока
 time.sleep(1)
@@ -100,6 +92,28 @@ def calculate_body_area(keypoints):
     return int(area)
 
 
+def select_target_person(keypoints_list, frame_width):
+    """Выбирает самого крупного человека около центра кадра."""
+    biggest_area = 0
+    best_center = None
+
+    for kpts in keypoints_list:
+        if len(kpts) < 13:
+            continue
+        try:
+            area = calculate_body_area(kpts)
+            cx_body, cy_body = calculate_body_center(kpts)
+            if area < 5000 or abs(cx_body - frame_width // 2) > frame_width * 0.4:
+                continue
+            if area > biggest_area * 1.2:
+                biggest_area = area
+                best_center = (cx_body, cy_body)
+        except Exception:
+            continue
+
+    return best_center, biggest_area
+
+
 def get_command(body_x, body_y, square, cx, cy):
     """
     Формирует команды управления дроном на основе положения тела.
@@ -111,119 +125,136 @@ def get_command(body_x, body_y, square, cx, cy):
     """
     if body_x > cx + DEAD_ZONE_X:
         fly.send_rc_control(0, 0, 0, 60)  # Поворот направо
+        return "GO RIGHT"
     elif body_x < cx - DEAD_ZONE_X:
         fly.send_rc_control(0, 0, 0, -60)  # Поворот налево
+        return "GO LEFT"
     elif body_y > cy + DEAD_ZONE_Y:
         fly.send_rc_control(0, 0, -60, 0)  # Вниз
+        return "GO DOWN"
     elif body_y < cy - DEAD_ZONE_Y:
         fly.send_rc_control(0, 0, 60, 0)  # Вверх
+        return "GO UP"
     elif square > 30000:
         fly.send_rc_control(0, -40, 0, 0)  # Назад (если человек близко)
+        return "GO BACK"
     elif square < 7000:
         fly.send_rc_control(0, 40, 0, 0)  # Вперёд (если далеко)
+        return "GO FORWARD"
     else:
         fly.send_rc_control(0, 0, 0, 0)  # Стоп
+        return "STOP"
 
 
-# === ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ ===
-try:
+def annotate_frame(frame, center, area, command, frame_center):
+    """Добавляет визуализацию на кадр."""
+    h, w = frame.shape[:2]
+
+    # Рисуем центр кадра
+    cv2.circle(frame, frame_center, 8, (0, 255, 0), -1)
+
+    # Если человек найден
+    if center is not None:
+        cv2.circle(frame, center, 10, (0, 0, 255), -1)
+        cv2.putText(
+            frame,
+            "Body Center",
+            (center[0] + 15, center[1] - 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+        )
+        # Отображение площади в кадре
+        cv2.putText(
+            frame,
+            f"Body Area: {area}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
+    # Команда всегда отображается
+    cv2.putText(
+        frame, command, (w - 125, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
+    )
+
+
+def process_frame(frame):
+    """Полная обработка одного кадра: детекция → выбор цели → команда → разметка."""
+    # Ресайзим кадр для модели
+    my_frame = cv2.resize(frame, (640, 480))
+    h, w = my_frame.shape[:2]
+    frame_center = (w // 2, h // 2)
+
+    # Детекция позы
+    results = model(my_frame, verbose=False)
+    result = results[0]
+    keypoints_list = (
+        result.keypoints.xy.cpu().tolist() if result.keypoints is not None else []
+    )
+
+    # Получаем размеченный кадр без bounding box
+    annotated_frame = result.plot(boxes=False)
+
+    # Выбираем цель
+    body_center, body_area = select_target_person(keypoints_list, w)
+
+    # Определяем команду
+    command = (
+        get_command(*body_center, body_area, *frame_center) if body_center else "STOP"
+    )
+
+    # Добавляем надписи в кадре
+    annotate_frame(annotated_frame, body_center, body_area, command, frame_center)
+
+    return annotated_frame, command
+
+
+def main():
+    frame_read = fly.get_frame_read()
+    """Основной цикл приложения."""
     while True:
-
-        # Получение кадра с камеры дрона
         frame = frame_read.frame
-
-        # Проверка на пустой кадр
         if frame is None or frame.size == 0:
-            print("Пустой кадр — пропуск...")
-            cv2.waitKey(1)
+            print("Ожидание кадра...")
+            time.sleep(0.1)
             continue
+        break
+    print("Первый кадр получен. Запуск основного цикла.")
 
-        # Подготовка изображения
-        my_frame = cv2.resize(frame, (640, 480))
-        h, w = my_frame.shape[:2]
-        center_x, center_y = w // 2, h // 2
+    time.sleep(1)
+    print("Отслеживание запущено. Нажмите 'q' для выхода.")
 
-        # Обнаружение и трекинг позы
-        results = model.track(my_frame, persist=True, verbose=False)
-        result = results[0]
+    try:
+        while True:
+            frame = frame_read.frame
+            # Проверка на пустой кадр
+            if frame is None or frame.size == 0:
+                print("Пустой кадр — пропуск...")
+                continue
 
-        # Визуализация: рисуем скелет, но без bounding box
-        annotated_frame = result.plot(boxes=False)
+            annotated_frame, command = process_frame(frame)
+            print(command)
 
-        # Отображаем центр кадра
-        cv2.circle(annotated_frame, (center_x, center_y), 8, (0, 0, 255), -1)
+            cv2.imshow(
+                "Pose Tracking", cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            )
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
-        # Извлечение данных
-        boxes = result.boxes
-        keypoints = result.keypoints
+    except KeyboardInterrupt:
+        print("\nПрерывание по Ctrl+C.")
+    finally:
+        cv2.destroyAllWindows()
+        fly.send_rc_control(0, 0, 0, 0)  # Остановить дрон
+        # fly.land()    # Посадка
+        print(f"Заряд батареи: {fly.get_battery()}%")
+        print("Конец полёта.")
+        fly.streamoff()
+        fly.end()
 
-        # Обработка обнаруженных людей
-        if (
-            boxes is not None
-            and boxes.id is not None
-            and len(boxes) > 0
-            and keypoints is not None
-        ):
-            # Список ID людей и ключевых точек
-            track_ids = boxes.id.int().cpu().tolist()
-            kpts_list = keypoints.xy.cpu().tolist()
 
-            # Автовыбор целевого человека (первый обнаруженный)
-            if TARGET_ID is None and len(track_ids) > 0:
-                TARGET_ID = track_ids[0]
-                print(f"Выбран ID для отслеживания: {TARGET_ID}")
-
-            # Если целевой человек найден
-            if TARGET_ID in track_ids:
-                idx = track_ids.index(TARGET_ID)
-                person_kpts = kpts_list[idx]
-
-                # Вычисляем центр и площадь тела
-                body_x, body_y = calculate_body_center(person_kpts)
-                body_square = calculate_body_area(person_kpts)
-
-                # Визуализация центра тела
-                cv2.circle(annotated_frame, (body_x, body_y), 8, (255, 0, 255), -1)
-
-                # Отображение площади в кадре
-                cv2.putText(
-                    annotated_frame,
-                    f"S: {body_square}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 0),
-                    2,
-                )
-
-                # Отправка управляющих команд
-                get_command(body_x, body_y, body_square, center_x, center_y)
-            else:
-                # Если целевой человек пропал
-                print("Целевой человек не найден. Сброс ID.")
-                TARGET_ID = None
-        else:
-            # Если люди не обнаружены
-            print("Люди не обнаружены.")
-            TARGET_ID = None
-
-        # Отображение кадра
-        cv2.imshow("Pose Tracking", cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB))
-
-        # Выход по нажатию 'q'
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-# Обработка исключений
-except KeyboardInterrupt:
-    print("\nПрерывание по Ctrl+C.")
-
-# Завершение работы
-finally:
-    cv2.destroyAllWindows()
-    fly.send_rc_control(0, 0, 0, 0)  # Остановить дрон
-    # fly.land()    # Посадка
-    print(f"Заряд батареи: {fly.get_battery()}%")
-    print("Конец полёта.")
-    fly.streamoff()
-    fly.end()
+if __name__ == "__main__":
+    main()
