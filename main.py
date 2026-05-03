@@ -1,301 +1,364 @@
-from ultralytics import YOLO
-from djitellopy import Tello
-import logging
-import cv2
-import time
-from collections import Counter
-
-# Отключаем логирование Tello (опционально)
-logging.getLogger("djitellopy").setLevel(logging.WARNING)
-
-# Загрузка предобученной модели YOLO
-model = YOLO("best_very_cool_potholes_scale.pt")
-
-# === ИНИЦИАЛИЗАЦИЯ ДРОНА ==;y=
-fly = Tello()
-fly.connect()
-fly.send_rc_control(0, 0, 0, 0)
-
-print(f"Заряд батареи: {fly.get_battery()}%")
-
-# Установка битрейта для видео
-fly.set_video_bitrate(Tello.BITRATE_AUTO)
-
-# Уменьшить частоту кадров для стабильности
-fly.set_video_fps(Tello.FPS_15)
-
-# === ВКЛЮЧЕНИЕ ВИДЕОПОТОКА ===
-fly.streamon()
-print("Видеопоток включён. Ожидание первого кадра...")
-
-frame_read = fly.get_frame_read()
-
-# Ждём первый валидный кадр
-while True:
-    frame = frame_read.frame
-    if frame is not None and frame.size > 0:
-        print("Первый кадр получен. Запуск основного цикла.")
-        break
-    else:
-        print("Ожидание кадра...")
-        time.sleep(0.1)
-
-# Стабилизация после запуска потока
-time.sleep(1)
-
-# === ВЗЛЁТ И ПОДГОТОВКА К ПОЛЁТУ ===
-fly.takeoff()
-time.sleep(3)
-print("Дрон взлетел. Начинаю полёт...")
-
-# Глобальные переменные
-start_time_total = time.time()
-flight_duration = 40  # Дрон будет лететь по кругу 40 секундq
-flying_circle = True
-unique_tracked_ids = set()
-
-# Настройки ПИД-регулятора
-# Kp = 0.15
-# Kd = 0.05
-# Ki = 0.01
-# Ui = 0
-
-# error_old = 0
-
-
-def track_and_count(frame, storage):
-    results = model.track(
-        frame,
-        verbose=False,
-        persist=True,
-        conf=0.6,
-        tracker="custom_tracker.yaml",
-    )[0]
-
-    if results.boxes.id is not None:
-        ids = results.boxes.id.int().tolist()
-        clss = results.boxes.cls.int().tolist()
-
-        # Сохранение уникальных ID и имен классов
-        for obj_id, cls_idx in zip(ids, clss):
-            storage.add((obj_id, model.names[cls_idx]))
-
-    return results, results.plot()
-
-
-try:
-    while flying_circle:
-        # Получение кадра
-        frame = frame_read.frame
-
-        # Проверка на пустой кадр
-        if frame is None or frame.size == 0:
-            print("Пустой кадр — пропуск...")
-            cv2.waitKey(1)
-            continue
-
-        # Масштабирование кадра
-        my_frame = cv2.resize(frame, (640, 480))
-
-        # Модель с трекингом
-        # results = model.track(
-        #     my_frame, conf=0.3, persist=True, verbose=False, imgsz=320
-        # )
-
-        # Обработка кадра с трекингом
-        results, annotated_frame = track_and_count(my_frame, unique_tracked_ids)
-
-        # Крутой пид-регулятор (возможно рабочийп)
-        # if results.boxes.xywh is not None and len(results.boxes.xywh) > 0:
-        #     x_center = results.boxes.xywh[0][0].item()
-        #     error = x_center - 320
-
-        #     Up = Kp * error
-        #     Ud = Kd * (error - error_old)
-        #     Ui = Ui + Ki * error
-
-        #     Ui = max(min(Ui, 10), -10)
-        #     U = Up + Ui + Ud
-        #     speed_LR = int(max(min(U, 35), -35))
-        #     error_old = error
-        # else:
-        #     speed_LR = 0
-        #     Ui = 0
-        #     error_old = 0
-
-        # Отображение
-        cv2.imshow(
-            "Potholes Detection", cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-        )
-
-        # Управление дроном: полёт
-        fly.send_rc_control(
-            left_right_velocity=25,  # Движение вправо
-            forward_backward_velocity=0,
-            up_down_velocity=0,
-            yaw_velocity=-25,  # Поворот по часовой стрелке
-        )
-
-        # Ограничиваем время полёта
-        if time.time() - start_time_total > flight_duration:
-            print("Завершение полёта.")
-            flying_circle = False
-
-        # Выход по 'q'
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            flying_circle = False
-
-except Exception as e:
-    print(f"Ошибка: {e}")
-finally:
-    # === ПОСАДКА И ЗАВЕРШЕНИЕ ===
-    fly.send_rc_control(0, 0, 0, 0)  # Остановить движение
-    fly.land()  # Посадка
-    fly.streamoff()
-    cv2.destroyAllWindows()
-    print(f"Итоговая статистика:")
-    final_counts = Counter(name for _, name in unique_tracked_ids)
-
-    for obj_name, count in final_counts.items():
-        print(f"- {obj_name}: {count}")
-
-    print(f"Полёт завершён. Заряд батареи: {fly.get_battery()}%")
-    fly.end()
+# Управление дроном Tello по жестам и позе человека
 
 from ultralytics import YOLO
 from djitellopy import Tello
-import logging
 import cv2
 import time
-from collections import Counter
+import logging
 
-# Отключаем логирование Tello (опционально)
+# === НАСТРОЙКИ ===
+DEAD_ZONE_X = 150  # Мёртвая зона по X (px)
+DEAD_ZONE_Y = 100  # Мёртвая зона по Y (px)
+
+# Индексы ключевых точек (COCO)
+LEFT_SHOULDER = 5
+RIGHT_SHOULDER = 6
+LEFT_HIP = 11
+RIGHT_HIP = 12
+
+# Классы жестов
+GESTURE_CLASSES = ["neutral", "go_up", "go_down", "go_left", "go_right"]
+NEUTRAL_GESTURE = "neutral"
+TAKEOFF_GESTURE = "go_up"
+LAND_GESTURE = "go_down"
+LEFT_GESTURE = "go_left"
+RIGHT_GESTURE = "go_right"
+
+# Минимальная уверенность для распознавания жеста
+GESTURE_CONF_THRESH = 0.7
+
+# Загрузка моделей
+POSE_MODEL = YOLO("yolov8n-pose.pt")  # Детекция позы
+GESTURE_MODEL = YOLO("best.pt")  # Распознавание жестов
+
+# Настройка логирования
 logging.getLogger("djitellopy").setLevel(logging.WARNING)
-
-# Загрузка предобученной модели YOLO
-model = YOLO("best_yamki-v2.pt")
-
-# === ИНИЦИАЛИЗАЦИЯ ДРОНА ===
 fly = Tello()
-fly.connect()
 
-print(f"Заряд батареи: {fly.get_battery()}%")
+# === ФУНКЦИИ ===
 
-# Установка битрейта для видео
-fly.set_video_bitrate(Tello.BITRATE_AUTO)
 
-# Уменьшить частоту кадров для стабильности
-fly.set_video_fps(Tello.FPS_15)
-
-# === ВКЛЮЧЕНИЕ ВИДЕОПОТОКА ===
-fly.streamon()
-print("Видеопоток включён. Ожидание первого кадра...")
-
-frame_read = fly.get_frame_read()
-
-# Ждём первый валидный кадр
-while True:
-    frame = frame_read.frame
-    if frame is not None and frame.size > 0:
-        print("Первый кадр получен. Запуск основного цикла.")
-        break
-    else:
-        print("Ожидание кадра...")
+def wait_for_valid_frame(frame_read):
+    """Ждёт первый валидный кадр с дрона."""
+    print("Ожидание первого кадра с дрона...")
+    while True:
+        frame = frame_read.frame
+        if frame is not None and frame.size > 0:
+            print("Первый кадр получен.")
+            return frame
         time.sleep(0.1)
 
-# Стабилизация после запуска потока
-time.sleep(1)
 
-# === ВЗЛЁТ И ПОДГОТОВКА К ПОЛЁТУ ===
-# fly.takeoff()
-time.sleep(3)
-print("Дрон взлетел. Начинаю полёт...")
+def check_gesture(frame):
+    """
+    Анализирует кадр и возвращает распознанный жест.
+    Возвращает: 'go_up', 'go_down', 'neutral'
+    """
+    results = GESTURE_MODEL(frame, verbose=False)
+    result = results[0]
 
-# Глобальные переменные
-start_time_total = time.time()
-flight_duration = 40  # Дрон будет лететь по кругу 40 секундq
-flying_circle = True
-unique_tracked_ids = set()
+    if result.boxes is None or len(result.boxes) == 0:
+        return NEUTRAL_GESTURE
 
+    confs = result.boxes.conf.cpu().numpy()
+    clss = result.boxes.cls.cpu().numpy()
 
-def track_and_count(frame, storage):
-    results = model.track(
-        frame,
-        verbose=False,
-        persist=True,
-        conf=0.6,
-        tracker="custom_tracker.yaml",
-    )[0]
+    max_conf_idx = confs.argmax()
+    if confs[max_conf_idx] >= GESTURE_CONF_THRESH:
+        cls_id = int(clss[max_conf_idx])
+        return GESTURE_CLASSES[cls_id]
 
-    if results.boxes.id is not None:
-        ids = results.boxes.id.int().tolist()
-        clss = results.boxes.cls.int().tolist()
-
-        # Сохранение уникальных ID и имен классов
-        for obj_id, cls_idx in zip(ids, clss):
-            storage.add((obj_id, model.names[cls_idx]))
-
-    return results.plot()
+    return NEUTRAL_GESTURE
 
 
-try:
-    while flying_circle:
+def calculate_body_center(keypoints):
+    """Вычисляет центр тела по плечам и бёдрам."""
+    points = [
+        keypoints[i] for i in (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP)
+    ]
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    return int(sum(xs) / 4), int(sum(ys) / 4)
 
-        # Получение кадра
-        frame = frame_read.frame
 
-        # Проверка на пустой кадр
-        if frame is None or frame.size == 0:
-            print("Пустой кадр — пропуск...")
-            cv2.waitKey(1)
+def calculate_body_area(keypoints):
+    """Вычисляет площадь четырёхугольника по ключевым точкам."""
+    x1, y1 = keypoints[LEFT_SHOULDER]
+    x2, y2 = keypoints[RIGHT_SHOULDER]
+    x3, y3 = keypoints[RIGHT_HIP]
+    x4, y4 = keypoints[LEFT_HIP]
+    area = (
+        abs(
+            (x1 * y2 + x2 * y3 + x3 * y4 + x4 * y1)
+            - (y1 * x2 + y2 * x3 + y3 * x4 + y4 * x1)
+        )
+        / 2
+    )
+    return int(area)
+
+
+def select_target_person(keypoints_list, frame_width):
+    """Выбирает самого крупного человека около центра кадра."""
+    biggest_area = 0
+    best_center = None
+
+    for kpts in keypoints_list:
+        if len(kpts) < 13:
+            continue
+        try:
+            area = calculate_body_area(kpts)
+            cx_body, cy_body = calculate_body_center(kpts)
+            if area < 5000 or abs(cx_body - frame_width // 2) > frame_width * 0.4:
+                continue
+            if area > biggest_area * 1.2:
+                biggest_area = area
+                best_center = (cx_body, cy_body)
+        except Exception as e:
             continue
 
-        # Масштабирование кадра
+    return best_center, biggest_area
+
+
+def get_command(body_x, body_y, area, frame_center_x, frame_center_y):
+    """Формирует команду управления дроном."""
+    if body_x > frame_center_x + DEAD_ZONE_X:
+        fly.send_rc_control(0, 0, 0, 60)  # Поворот направо
+        return "GO RIGHT"
+    elif body_x < frame_center_x - DEAD_ZONE_X:
+        fly.send_rc_control(0, 0, 0, -60)  # Поворот налево
+        return "GO LEFT"
+    elif body_y > frame_center_y + DEAD_ZONE_Y:
+        fly.send_rc_control(0, 0, -60, 0)  # Вниз
+        return "GO DOWN"
+    elif body_y < frame_center_y - DEAD_ZONE_Y:
+        fly.send_rc_control(0, 0, 60, 0)  # Вверх
+        return "GO UP"
+    elif area > 30000:
+        fly.send_rc_control(0, -40, 0, 0)  # Назад
+        return "GO BACK"
+    elif area < 7000:
+        fly.send_rc_control(0, 40, 0, 0)  # Вперёд
+        return "GO FORWARD"
+    else:
+        fly.send_rc_control(0, 0, 0, 0)  # Стоп
+        return "STOP"
+
+
+def annotate_frame(frame, center, area, command, frame_center, gesture):
+    """Добавляет аннотации на кадр."""
+    h, w = frame.shape[:2]
+
+    # Центр кадра
+    cv2.circle(frame, frame_center, 8, (0, 255, 0), -1)
+
+    # Центр тела
+    if center is not None:
+        cv2.circle(frame, center, 10, (0, 0, 255), -1)
+        cv2.putText(
+            frame,
+            "Body Center",
+            (center[0] + 15, center[1] - 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            f"Area: {area}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
+
+    # Команда и жест
+    cv2.putText(
+        frame,
+        f"Cmd: {command}",
+        (w - 150, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 0),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"Gesture: {gesture}",
+        (10, h - 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+    )
+
+
+def process_frame(frame):
+    """Обработка одного кадра: поза → выбор цели → команда → аннотация."""
+    my_frame = cv2.resize(frame, (640, 480))
+    h, w = my_frame.shape[:2]
+    frame_center = (w // 2, h // 2)
+
+    # Детекция позы
+    results = POSE_MODEL(my_frame, verbose=False)
+    result = results[0]
+    keypoints_list = (
+        result.keypoints.xy.cpu().tolist() if result.keypoints is not None else []
+    )
+    annotated_frame = result.plot(boxes=False)  # Только скелеты
+
+    # Выбор цели
+    body_center, body_area = select_target_person(keypoints_list, w)
+
+    # Жест
+    gesture = check_gesture(my_frame)
+
+    # Влево/вправо
+    get_right_left(gesture)
+
+    # Команда
+    command = (
+        get_command(*body_center, body_area, *frame_center) if body_center else "STOP"
+    )
+
+    # Аннотация
+    annotate_frame(
+        annotated_frame, body_center, body_area, command, frame_center, gesture
+    )
+
+    return annotated_frame, command, gesture
+
+
+def wait_for_takeoff(frame_read):
+    """Ждёт жест 'go_up' для взлёта."""
+    print("Ожидание жеста для взлёта (поднимите руки — 'go_up')...")
+    while True:
+        frame = frame_read.frame
+        if frame is None or frame.size == 0:
+            continue
+
         my_frame = cv2.resize(frame, (640, 480))
+        gesture = check_gesture(my_frame)
 
-        # Модель с трекингом
-        # results = model.track(
-        #     my_frame, conf=0.3, persist=True, verbose=False, imgsz=320
-        # )
-
-        # Обработка кадра с трекингом
-        annotated_frame = track_and_count(my_frame, unique_tracked_ids)
-
-        # Отображение
-        cv2.imshow(
-            "Potholes Detection", cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        # Отладочное отображение
+        cv2.putText(
+            my_frame,
+            "Status: Waiting TAKEOFF",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
         )
-
-        # Управление дроном: полёт)
-        fly.send_rc_control(
-            left_right_velocity=0,  # Движение вправо
-            forward_backward_velocity=20,
-            up_down_velocity=0,
-            yaw_velocity=0,  # Поворот по часовой стрелке
+        cv2.putText(
+            my_frame,
+            f"Gesture: {gesture}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 0),
+            2,
         )
+        cv2.imshow("Pose Tracking", cv2.cvtColor(my_frame, cv2.COLOR_BGR2RGB))
 
-        # Ограничиваем время полёта
-        if time.time() - start_time_total > flight_duration:
-            print("Завершение полёта.")
-            flying_circle = False
+        if gesture == TAKEOFF_GESTURE:
+            print("Жест 'TAKEOFF' распознан. Взлёт!")
+            fly.takeoff()
+            time.sleep(2)
+            # cv2.waitKey(500)
+            break
 
-        # Выход по 'q'
         if cv2.waitKey(1) & 0xFF == ord("q"):
-            flying_circle = False
+            print("Выход без взлёта.")
+            fly.end()
+            exit(0)
 
-except Exception as e:
-    print(f"Ошибка: {e}")
-finally:
-    # === ПОСАДКА И ЗАВЕРШЕНИЕ ===
-    fly.send_rc_control(0, 0, 0, 0)  # Остановить движение
-    # fly.land()    # Посадка
+
+def get_right_left(gesture):
+    if gesture == LEFT_GESTURE:
+        fly.send_rc_control(30, 0, 0, 0)
+        # time.sleep(2)
+    elif gesture == RIGHT_GESTURE:
+        fly.send_rc_control(-30, 0, 0, 0)
+        # time.sleep(2)
+    # else:
+    #     fly.send_rc_control(0, 0, 0, 0)
+
+
+def drone_init():
+    """Инициализация дрона."""
+    fly.connect()
+    print(f"Заряд батареи: {fly.get_battery()}%")
+
+    fly.set_video_fps(Tello.FPS_15)
+    fly.set_video_bitrate(Tello.BITRATE_AUTO)
+
     fly.streamoff()
-    cv2.destroyAllWindows()
-    print(f"Итоговая статистика:")
-    final_counts = Counter(name for _, name in unique_tracked_ids)
+    time.sleep(1)
+    fly.streamon()
+    time.sleep(2)
 
-    for obj_name, count in final_counts.items():
-        print(f"- {obj_name}: {count}")
+    fly.send_rc_control(0, 0, 0, 0)  # Остановить все движения
 
-    print(f"Полёт завершён. Заряд батареи: {fly.get_battery()}%")
-    fly.end()
+
+def main():
+    drone_init()
+    frame_read = fly.get_frame_read()
+
+    wait_for_valid_frame(frame_read)
+    time.sleep(1)
+
+    wait_for_takeoff(frame_read)
+
+    print("Дрон в воздухе. Управление запущено.")
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None or frame.size == 0:
+                print("Пустой кадр — пропуск...")
+                continue
+
+            annotated_frame, command, gesture = process_frame(frame)
+            print(f"Command: {command}, Gesture: {gesture}")
+
+            # Посадка по жесту
+            if gesture == LAND_GESTURE:
+                print("Жест 'LAND' распознан. Посадка.")
+                cv2.putText(
+                    annotated_frame,
+                    "LANDING...",
+                    (200, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 255),
+                    3,
+                )
+                # cv2.imshow("Pose Tracking", annotated_frame)
+                cv2.imshow(
+                    "Pose Tracking", cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                )
+                cv2.waitKey(1000)
+                fly.land()
+                break
+
+            cv2.imshow(
+                "Pose Tracking", cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            )
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    except KeyboardInterrupt:
+        print("\nПрерывание по Ctrl+C.")
+    finally:
+        fly.send_rc_control(0, 0, 0, 0)
+        fly.streamoff()
+        fly.end()
+        cv2.destroyAllWindows()
+        print("Полёт завершён.")
+
+
+if __name__ == "__main__":
+    main()
